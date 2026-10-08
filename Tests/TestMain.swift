@@ -10,6 +10,7 @@ struct FreeFlowTests {
         LLMCooldownManagerTests.run()
         TranscriptionErrorPresentationCoreTests.run()
         TranscriptTextCoreTests.run()
+        RecordingOverlayPlacementTests.run()
         print("FreeFlowTests passed")
     }
 }
