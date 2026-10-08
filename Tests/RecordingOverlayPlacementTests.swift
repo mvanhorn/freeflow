@@ -11,6 +11,9 @@ enum RecordingOverlayPlacementTests {
         testAnchorOutsideAllScreensFallsBack()
         testAXToAppKitFlipUsesPrimaryScreenHeight()
         testEntranceUsesTheAnchorScreen()
+        testCachedDisplayStillConnected()
+        testCachedDisplayDisconnected()
+        testCachedDisplayRearranged()
     }
 
     /// Secondary display to the left of the primary (negative x). A caret
@@ -235,5 +238,58 @@ enum RecordingOverlayPlacementTests {
         TestSupport.expect(entrance.minX < 0, "entrance left the anchor display")
         TestSupport.expect(clampedToPrimary.minX >= 0, "fixture: primary clamp should pull a left-display frame across")
         TestSupport.expect(entrance.minX != clampedToPrimary.minX, "entrance matched the primary-screen clamp")
+    }
+
+    /// The cached anchor's display is still connected: it is found by ID,
+    /// wherever it sits in the screen list.
+    private static func testCachedDisplayStillConnected() {
+        let connected: [CGDirectDisplayID?] = [1, 7, 42]
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: connected),
+            2
+        )
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 1, in: connected),
+            0
+        )
+    }
+
+    /// The cached display was unplugged mid-show. It must not be reused, so
+    /// the caller re-anchors on a live screen instead of placing the overlay
+    /// on the vanished display's coordinates.
+    private static func testCachedDisplayDisconnected() {
+        let afterDisconnect: [CGDirectDisplayID?] = [1]
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: afterDisconnect),
+            nil
+        )
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: []),
+            nil
+        )
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: nil, in: [1, 42]),
+            nil
+        )
+        // A screen without an ID never stands in for the cached display.
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: [nil, 1]),
+            nil
+        )
+    }
+
+    /// Rearranging displays changes frames and list order but not IDs; the
+    /// cached display still resolves, at its new index.
+    private static func testCachedDisplayRearranged() {
+        let before: [CGDirectDisplayID?] = [1, 42]
+        let after: [CGDirectDisplayID?] = [42, 1]
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: before),
+            1
+        )
+        TestSupport.expectEqual(
+            RecordingOverlayPlacement.connectedDisplayIndex(of: 42, in: after),
+            0
+        )
     }
 }

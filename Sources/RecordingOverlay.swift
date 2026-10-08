@@ -92,14 +92,33 @@ final class RecordingOverlayManager {
     private let overlayState = RecordingOverlayState()
     private var lockedOverlayWidth: CGFloat?
     // Cached for the current show. Frame and layout read these instead of
-    // issuing AX calls; a nil anchor falls back to the pointer.
+    // issuing AX calls; a nil anchor falls back to the pointer. The screen is
+    // kept as a display ID and looked up live, so a display that disconnects
+    // mid-show is never used for placement.
     private var cachedNearCursorAnchor: NSPoint?
-    private var cachedNearCursorScreen: NSScreen?
+    private var cachedNearCursorDisplayID: CGDirectDisplayID?
     private var nearCursorAnchorToken: UUID?
     private var nearCursorCaretLookupStarted = false
+    private var screenParametersObserver: NSObjectProtocol?
 
     var onStopButtonPressed: (() -> Void)?
     var onUpdateOverlayPressed: (() -> Void)?
+
+    init() {
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenParametersChange()
+        }
+    }
+
+    deinit {
+        if let screenParametersObserver {
+            NotificationCenter.default.removeObserver(screenParametersObserver)
+        }
+    }
 
     /// The screen the overlay should drop down on. The user picks one of
     /// three modes in Settings, stored in UserDefaults under
@@ -176,6 +195,17 @@ final class RecordingOverlayManager {
         cachedNearCursorAnchor ?? NSEvent.mouseLocation
     }
 
+    /// Live screen for the cached anchor's display, or nil when nothing is
+    /// cached or that display has been disconnected since.
+    private var cachedNearCursorScreen: NSScreen? {
+        let screens = NSScreen.screens
+        guard let index = RecordingOverlayPlacement.connectedDisplayIndex(
+            of: cachedNearCursorDisplayID,
+            in: screens.map(\.displayID)
+        ) else { return nil }
+        return screens[index]
+    }
+
     /// Screen of the cached anchor — the same point `overlayFrame` uses — so
     /// the settled frame and the entrance animation clamp to one display.
     private func resolvedNearCursorScreen(fallback: NSScreen) -> NSScreen {
@@ -188,17 +218,32 @@ final class RecordingOverlayManager {
     private func storeNearCursorAnchor(_ anchor: NSPoint) {
         cachedNearCursorAnchor = anchor
         guard let fallback = targetScreen ?? cachedNearCursorScreen ?? NSScreen.screens.first else {
-            cachedNearCursorScreen = nil
+            cachedNearCursorDisplayID = nil
             return
         }
-        cachedNearCursorScreen = screen(containing: anchor, fallback: fallback)
+        cachedNearCursorDisplayID = screen(containing: anchor, fallback: fallback).displayID
+    }
+
+    /// The cached anchor's display was disconnected during this show:
+    /// re-anchor at the pointer, which is always on a connected screen.
+    private func dropStaleNearCursorAnchorIfNeeded() {
+        guard cachedNearCursorAnchor != nil,
+              cachedNearCursorDisplayID != nil,
+              cachedNearCursorScreen == nil else { return }
+        storeNearCursorAnchor(NSEvent.mouseLocation)
+    }
+
+    private func handleScreenParametersChange() {
+        guard overlayWindow != nil else { return }
+        dropStaleNearCursorAnchorIfNeeded()
+        updateOverlayLayout(animated: false)
     }
 
     private func cancelNearCursorAnchorResolution() {
         nearCursorAnchorToken = nil
         nearCursorCaretLookupStarted = false
         cachedNearCursorAnchor = nil
-        cachedNearCursorScreen = nil
+        cachedNearCursorDisplayID = nil
     }
 
     /// Records the pointer anchor once per near-cursor show, before frame
@@ -232,10 +277,10 @@ final class RecordingOverlayManager {
                     fromAXCaretRect: caretRect,
                     primaryScreenHeight: primaryScreenHeight
                 )
-                let previousScreen = self.cachedNearCursorScreen
+                let previousDisplayID = self.cachedNearCursorDisplayID
                 self.storeNearCursorAnchor(anchor)
                 guard self.usesNearCursorOverlayPlacement else { return }
-                let screenChanged = previousScreen?.frame != self.cachedNearCursorScreen?.frame
+                let screenChanged = previousDisplayID != self.cachedNearCursorDisplayID
                 self.updateOverlayLayout(animated: !screenChanged)
             }
         }
@@ -400,6 +445,7 @@ final class RecordingOverlayManager {
 
     private func showOverlayPanel(animatedResize: Bool) {
         seedNearCursorAnchorIfNeeded()
+        dropStaleNearCursorAnchorIfNeeded()
         let frame = overlayFrame
 
         if let panel = overlayWindow {
@@ -455,6 +501,7 @@ final class RecordingOverlayManager {
     private func updateOverlayLayout(animated: Bool) {
         guard let panel = overlayWindow else { return }
         seedNearCursorAnchorIfNeeded()
+        dropStaleNearCursorAnchorIfNeeded()
         let frame = overlayFrame
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
         panel.contentView = makeOverlayContent(frame: frame)
@@ -515,7 +562,13 @@ final class RecordingOverlayManager {
 
     private func resize(panel: NSPanel, to frame: NSRect, animated: Bool) {
         guard animated else {
-            panel.setFrame(frame, display: true)
+            // Go through the animator with zero duration: a plain setFrame
+            // leaves an in-flight frame animation (the entrance) running, and
+            // it would land back on its original target.
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                panel.animator().setFrame(frame, display: true)
+            }
             return
         }
 
@@ -593,12 +646,18 @@ final class RecordingOverlayManager {
         }
 
         let anchor = resolvedNearCursorAnchor()
-        let nearCursorScreen = cachedNearCursorScreen ?? screen(containing: anchor, fallback: targetScreen)
+        let nearCursorScreen = resolvedNearCursorScreen(fallback: targetScreen)
         return RecordingOverlayPlacement.nearCursorOverlayFrame(
             anchor: anchor,
             size: CGSize(width: width, height: height),
             visibleFrame: nearCursorScreen.visibleFrame
         )
+    }
+
+    /// Top-anchored pills widen to cover the notch. A near-cursor pill sits
+    /// at the caret or pointer, away from the notch, so it keeps its own width.
+    private var widensForNotch: Bool {
+        screenHasNotch && !usesNearCursorOverlayPlacement
     }
 
     private var overlayWidth: CGFloat {
@@ -620,13 +679,13 @@ final class RecordingOverlayManager {
                 let estimated = CGFloat(msg.count) * 6.8 + 60
                 return min(420, max(180, estimated))
             }()
-            guard screenHasNotch else { return feedbackWidth }
+            guard widensForNotch else { return feedbackWidth }
             return max(notchWidth, feedbackWidth)
         }
 
         if overlayState.phase == .updateAvailable {
             let updateWidth: CGFloat = 190
-            guard screenHasNotch else { return updateWidth }
+            guard widensForNotch else { return updateWidth }
             return max(notchWidth, updateWidth)
         }
 
@@ -643,7 +702,7 @@ final class RecordingOverlayManager {
             baseWidth = defaultWidth
         }
 
-        guard screenHasNotch else { return baseWidth }
+        guard widensForNotch else { return baseWidth }
         return max(notchWidth, baseWidth)
     }
 

@@ -25,6 +25,19 @@ enum RecordingOverlayPlacement {
         screenFrames.first { $0.contains(anchor) } ?? fallback
     }
 
+    /// Index in `connectedDisplayIDs` of the display a cached anchor was
+    /// resolved on, or nil when nothing is cached or that display has been
+    /// disconnected since. Matching is by display ID, not frame, so a
+    /// rearranged display still matches and a vanished one never does.
+    /// Entries that are nil (screens without an ID) never match.
+    static func connectedDisplayIndex(
+        of cachedDisplayID: CGDirectDisplayID?,
+        in connectedDisplayIDs: [CGDirectDisplayID?]
+    ) -> Int? {
+        guard let cachedDisplayID else { return nil }
+        return connectedDisplayIDs.firstIndex { $0 == cachedDisplayID }
+    }
+
     /// Pins `frame` inside `visibleFrame`. A frame larger than the visible
     /// area is centered on it instead of shoved against a corner — including
     /// when that visible area sits left of or below the primary display.
