@@ -80,11 +80,23 @@ private func makeNotchContent<V: View>(
 // MARK: - Manager
 
 final class RecordingOverlayManager {
-    private static let nearCursorOverlayGap: CGFloat = 8
+    /// Bounds each cross-process Accessibility message. The lookup runs off
+    /// the main thread; layout never waits on it.
+    private static let caretAnchorMessagingTimeout: Float = 0.25
+    private static let nearCursorAnchorQueue = DispatchQueue(
+        label: "com.zachlatta.freeflow.near-cursor-anchor",
+        qos: .userInitiated
+    )
 
     private var overlayWindow: NSPanel?
     private let overlayState = RecordingOverlayState()
     private var lockedOverlayWidth: CGFloat?
+    // Cached for the current show. Frame and layout read these instead of
+    // issuing AX calls; a nil anchor falls back to the pointer.
+    private var cachedNearCursorAnchor: NSPoint?
+    private var cachedNearCursorScreen: NSScreen?
+    private var nearCursorAnchorToken: UUID?
+    private var nearCursorCaretLookupStarted = false
 
     var onStopButtonPressed: (() -> Void)?
     var onUpdateOverlayPressed: (() -> Void)?
@@ -116,12 +128,14 @@ final class RecordingOverlayManager {
     }
 
     /// `0` keeps the drop-down overlay at the top of the display. `1` moves
-    /// only the standard pill near the pointer; winged notch layout stays top-
-    /// anchored because it is part of the menu-bar affordance.
+    /// the standard pill near the caret or pointer.
     private var overlayVerticalPosition: Int {
         UserDefaults.standard.integer(forKey: "overlay_vertical_position")
     }
 
+    /// The winged/notch style always stays top-anchored and ignores the
+    /// near-cursor setting. It is drawn around the notch, so a caret- or
+    /// pointer-relative frame would pull it off the menu-bar cutout.
     private var usesNearCursorOverlayPlacement: Bool {
         overlayVerticalPosition == 1 && !useWingedLayout
     }
@@ -149,47 +163,128 @@ final class RecordingOverlayManager {
     }
 
     private func screen(containing point: NSPoint, fallback: NSScreen) -> NSScreen {
-        NSScreen.screens.first { screen in
-            screen.frame.contains(point)
-        } ?? fallback
+        let screens = NSScreen.screens
+        let chosen = RecordingOverlayPlacement.screenFrame(
+            containing: point,
+            screenFrames: screens.map(\.frame),
+            fallback: fallback.frame
+        )
+        return screens.first { $0.frame == chosen } ?? fallback
     }
 
-    private func nearCursorAnchorPoint() -> NSPoint {
-        let mouseLocation = NSEvent.mouseLocation
+    private func resolvedNearCursorAnchor() -> NSPoint {
+        cachedNearCursorAnchor ?? NSEvent.mouseLocation
+    }
+
+    /// Screen of the cached anchor — the same point `overlayFrame` uses — so
+    /// the settled frame and the entrance animation clamp to one display.
+    private func resolvedNearCursorScreen(fallback: NSScreen) -> NSScreen {
+        if let cachedNearCursorScreen {
+            return cachedNearCursorScreen
+        }
+        return screen(containing: resolvedNearCursorAnchor(), fallback: fallback)
+    }
+
+    private func storeNearCursorAnchor(_ anchor: NSPoint) {
+        cachedNearCursorAnchor = anchor
+        guard let fallback = targetScreen ?? cachedNearCursorScreen ?? NSScreen.screens.first else {
+            cachedNearCursorScreen = nil
+            return
+        }
+        cachedNearCursorScreen = screen(containing: anchor, fallback: fallback)
+    }
+
+    private func cancelNearCursorAnchorResolution() {
+        nearCursorAnchorToken = nil
+        nearCursorCaretLookupStarted = false
+        cachedNearCursorAnchor = nil
+        cachedNearCursorScreen = nil
+    }
+
+    /// Records the pointer anchor once per near-cursor show, before frame
+    /// calculation. Does not touch Accessibility.
+    private func seedNearCursorAnchorIfNeeded() {
+        guard usesNearCursorOverlayPlacement else { return }
+        guard nearCursorAnchorToken == nil else { return }
+        nearCursorAnchorToken = UUID()
+        nearCursorCaretLookupStarted = false
+        storeNearCursorAnchor(NSEvent.mouseLocation)
+    }
+
+    /// Starts the caret read after the panel is up. The overlay is already
+    /// on screen at the pointer, so a slow or dead target app cannot block
+    /// the show. A late result is applied only if this show is still up.
+    private func startNearCursorCaretLookupIfNeeded() {
+        guard usesNearCursorOverlayPlacement else { return }
+        guard let token = nearCursorAnchorToken, !nearCursorCaretLookupStarted else { return }
+        nearCursorCaretLookupStarted = true
+
+        Self.nearCursorAnchorQueue.async {
+            let caretRect = Self.focusedCaretRect()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.nearCursorAnchorToken == token, self.overlayWindow != nil else { return }
+                guard let caretRect else { return }
+                // AX y is measured from the top of the primary display, not
+                // from the display that contains the caret.
+                guard let primaryScreenHeight = NSScreen.screens.first?.frame.height else { return }
+                let anchor = RecordingOverlayPlacement.appKitAnchor(
+                    fromAXCaretRect: caretRect,
+                    primaryScreenHeight: primaryScreenHeight
+                )
+                let previousScreen = self.cachedNearCursorScreen
+                self.storeNearCursorAnchor(anchor)
+                guard self.usesNearCursorOverlayPlacement else { return }
+                let screenChanged = previousScreen?.frame != self.cachedNearCursorScreen?.frame
+                self.updateOverlayLayout(animated: !screenChanged)
+            }
+        }
+    }
+
+    /// Background-only. Each element gets a bounded messaging timeout so an
+    /// unresponsive target app cannot stall this queue indefinitely. Returns
+    /// nil when AX is unavailable or the caret rect is empty; the caller
+    /// keeps the pointer anchor.
+    private static func focusedCaretRect() -> CGRect? {
         let systemWide = AXUIElementCreateSystemWide()
-        var focusedValue: CFTypeRef?, rangeValue: CFTypeRef?, boundsValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedValue) == .success,
-              let focusedRaw = focusedValue, CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return mouseLocation }
+        _ = AXUIElementSetMessagingTimeout(systemWide, caretAnchorMessagingTimeout)
+
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        ) == .success,
+              let focusedRaw = focusedValue,
+              CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return nil }
+
         let focusedElement = unsafeBitCast(focusedRaw, to: AXUIElement.self)
-        guard AXUIElementCopyAttributeValue(focusedElement, kAXSelectedTextRangeAttribute as CFString, &rangeValue) == .success,
-              let rangeRaw = rangeValue, CFGetTypeID(rangeRaw) == AXValueGetTypeID(),
-              AXUIElementCopyParameterizedAttributeValue(focusedElement, kAXBoundsForRangeParameterizedAttribute as CFString, rangeRaw, &boundsValue) == .success,
-              let boundsRaw = boundsValue, CFGetTypeID(boundsRaw) == AXValueGetTypeID() else { return mouseLocation }
+        _ = AXUIElementSetMessagingTimeout(focusedElement, caretAnchorMessagingTimeout)
+
+        var rangeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            &rangeValue
+        ) == .success,
+              let rangeRaw = rangeValue,
+              CFGetTypeID(rangeRaw) == AXValueGetTypeID() else { return nil }
+
+        var boundsValue: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            focusedElement,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            rangeRaw,
+            &boundsValue
+        ) == .success,
+              let boundsRaw = boundsValue,
+              CFGetTypeID(boundsRaw) == AXValueGetTypeID() else { return nil }
+
         var rect = CGRect.zero
-        guard AXValueGetValue(unsafeBitCast(boundsRaw, to: AXValue.self), .cgRect, &rect), rect.height > 0, rect != .zero else { return mouseLocation }
-        let mainHeight = NSScreen.screens.first?.frame.height ?? mouseLocation.y + rect.maxY
-        return NSPoint(x: rect.midX, y: mainHeight - rect.maxY)
-    }
-
-    private func clampedFrame(_ frame: NSRect, to visibleFrame: NSRect) -> NSRect {
-        let maxX = visibleFrame.maxX - frame.width
-        let maxY = visibleFrame.maxY - frame.height
-
-        let x: CGFloat
-        if maxX >= visibleFrame.minX {
-            x = min(max(frame.origin.x, visibleFrame.minX), maxX)
-        } else {
-            x = visibleFrame.midX - frame.width / 2
-        }
-
-        let y: CGFloat
-        if maxY >= visibleFrame.minY {
-            y = min(max(frame.origin.y, visibleFrame.minY), maxY)
-        } else {
-            y = visibleFrame.midY - frame.height / 2
-        }
-
-        return NSRect(x: x, y: y, width: frame.width, height: frame.height)
+        guard AXValueGetValue(unsafeBitCast(boundsRaw, to: AXValue.self), .cgRect, &rect),
+              rect.height > 0,
+              rect != .zero else { return nil }
+        return rect
     }
 
     func showInitializing(mode: RecordingTriggerMode = .hold, isCommandMode: Bool = false) {
@@ -304,6 +399,7 @@ final class RecordingOverlayManager {
     }
 
     private func showOverlayPanel(animatedResize: Bool) {
+        seedNearCursorAnchorIfNeeded()
         let frame = overlayFrame
 
         if let panel = overlayWindow {
@@ -312,6 +408,7 @@ final class RecordingOverlayManager {
             resize(panel: panel, to: frame, animated: animatedResize)
             panel.alphaValue = 1
             panel.orderFrontRegardless()
+            startNearCursorCaretLookupIfNeeded()
             return
         }
 
@@ -320,18 +417,24 @@ final class RecordingOverlayManager {
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
         panel.contentView = makeOverlayContent(frame: frame)
 
-        guard let screen = targetScreen else { return }
+        guard let screen = targetScreen else {
+            cancelNearCursorAnchorResolution()
+            return
+        }
 
         let hiddenFrame: NSRect
         if usesNearCursorOverlayPlacement {
-            let overlayScreen = self.screen(containing: NSEvent.mouseLocation, fallback: screen)
+            let overlayScreen = resolvedNearCursorScreen(fallback: screen)
             let entranceFrame = NSRect(
                 x: frame.origin.x,
                 y: frame.origin.y + frame.height,
                 width: frame.width,
                 height: frame.height
             )
-            hiddenFrame = clampedFrame(entranceFrame, to: overlayScreen.visibleFrame)
+            hiddenFrame = RecordingOverlayPlacement.clampedFrame(
+                entranceFrame,
+                to: overlayScreen.visibleFrame
+            )
         } else {
             hiddenFrame = NSRect(x: frame.origin.x, y: screen.frame.maxY, width: frame.width, height: frame.height)
         }
@@ -346,14 +449,17 @@ final class RecordingOverlayManager {
         }
 
         overlayWindow = panel
+        startNearCursorCaretLookupIfNeeded()
     }
 
     private func updateOverlayLayout(animated: Bool) {
         guard let panel = overlayWindow else { return }
+        seedNearCursorAnchorIfNeeded()
         let frame = overlayFrame
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
         panel.contentView = makeOverlayContent(frame: frame)
         resize(panel: panel, to: frame, animated: animated)
+        startNearCursorCaretLookupIfNeeded()
     }
 
     private func setTranscribingPhase() {
@@ -461,11 +567,7 @@ final class RecordingOverlayManager {
             return NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight)
         }
 
-        let usesNearCursorPosition = overlayVerticalPosition == 1
-        let mouseLocation = usesNearCursorPosition ? nearCursorAnchorPoint() : NSEvent.mouseLocation
-        let screen = usesNearCursorPosition
-            ? self.screen(containing: mouseLocation, fallback: targetScreen)
-            : targetScreen
+        let usesNearCursorPosition = usesNearCursorOverlayPlacement
         let width = overlayWidth
         let useCompact = (UserDefaults.standard.object(forKey: "use_compact_overlay") as? Bool) ?? true
         let forceDropDownPill = overlayState.phase == .feedback
@@ -484,18 +586,18 @@ final class RecordingOverlayManager {
                 ? notchOverlap
                 : 38 + (screenHasNotch ? notchOverlap : 0)
         }
-        let x = usesNearCursorPosition
-            ? mouseLocation.x - width / 2
-            : screen.frame.midX - width / 2
-        let y = screen.frame.maxY - height
         guard usesNearCursorPosition else {
+            let x = targetScreen.frame.midX - width / 2
+            let y = targetScreen.frame.maxY - height
             return NSRect(x: x, y: y, width: width, height: height)
         }
 
-        let nearCursorY = mouseLocation.y - Self.nearCursorOverlayGap - height
-        return clampedFrame(
-            NSRect(x: x, y: nearCursorY, width: width, height: height),
-            to: screen.visibleFrame
+        let anchor = resolvedNearCursorAnchor()
+        let nearCursorScreen = cachedNearCursorScreen ?? screen(containing: anchor, fallback: targetScreen)
+        return RecordingOverlayPlacement.nearCursorOverlayFrame(
+            anchor: anchor,
+            size: CGSize(width: width, height: height),
+            visibleFrame: nearCursorScreen.visibleFrame
         )
     }
 
@@ -552,6 +654,7 @@ final class RecordingOverlayManager {
     }
 
     private func dismissAll() {
+        cancelNearCursorAnchorResolution()
         lockedOverlayWidth = nil
         overlayState.isCommandMode = false
         overlayState.updateVersion = ""
