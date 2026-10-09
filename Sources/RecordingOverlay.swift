@@ -266,8 +266,13 @@ final class RecordingOverlayManager {
         guard let token = nearCursorAnchorToken, !nearCursorCaretLookupStarted else { return }
         nearCursorCaretLookupStarted = true
 
-        Self.nearCursorAnchorQueue.async {
-            let caretRect = Self.focusedCaretRect()
+        let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        Self.nearCursorAnchorQueue.async { [weak self] in
+            let caretRect = CaretAnchorReader.caretRect(
+                pid: frontmostPid,
+                timeout: Self.caretAnchorMessagingTimeout,
+                client: SystemCaretAnchorAXClient()
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 guard self.nearCursorAnchorToken == token, self.overlayWindow != nil else { return }
@@ -286,52 +291,6 @@ final class RecordingOverlayManager {
                 self.updateOverlayLayout(animated: !screenChanged)
             }
         }
-    }
-
-    /// Background-only. Each element gets a bounded messaging timeout so an
-    /// unresponsive target app cannot stall this queue indefinitely. Returns
-    /// nil when AX is unavailable or the caret rect is empty; the caller
-    /// keeps the pointer anchor.
-    private static func focusedCaretRect() -> CGRect? {
-        let systemWide = AXUIElementCreateSystemWide()
-        _ = AXUIElementSetMessagingTimeout(systemWide, caretAnchorMessagingTimeout)
-
-        var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        ) == .success,
-              let focusedRaw = focusedValue,
-              CFGetTypeID(focusedRaw) == AXUIElementGetTypeID() else { return nil }
-
-        let focusedElement = unsafeBitCast(focusedRaw, to: AXUIElement.self)
-        _ = AXUIElementSetMessagingTimeout(focusedElement, caretAnchorMessagingTimeout)
-
-        var rangeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            focusedElement,
-            kAXSelectedTextRangeAttribute as CFString,
-            &rangeValue
-        ) == .success,
-              let rangeRaw = rangeValue,
-              CFGetTypeID(rangeRaw) == AXValueGetTypeID() else { return nil }
-
-        var boundsValue: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-            focusedElement,
-            kAXBoundsForRangeParameterizedAttribute as CFString,
-            rangeRaw,
-            &boundsValue
-        ) == .success,
-              let boundsRaw = boundsValue,
-              CFGetTypeID(boundsRaw) == AXValueGetTypeID() else { return nil }
-
-        var rect = CGRect.zero
-        guard AXValueGetValue(unsafeBitCast(boundsRaw, to: AXValue.self), .cgRect, &rect),
-              rect.height > 0,
-              rect != .zero else { return nil }
-        return rect
     }
 
     func showInitializing(mode: RecordingTriggerMode = .hold, isCommandMode: Bool = false) {
